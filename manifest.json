@@ -1,0 +1,10 @@
+{
+  "id": "ai-task-picker",
+  "name": "AI Task Picker",
+  "version": "0.3.0",
+  "minAppVersion": "1.5.0",
+  "description": "Collect open tasks from configured folders, rank them with OpenAI based on a priorities section in the current note, and insert linked task embeds at the cursor.",
+  "author": "Your Name",
+  "authorUrl": "https://github.com/yourname",
+  "isDesktopOnly": false
+}
