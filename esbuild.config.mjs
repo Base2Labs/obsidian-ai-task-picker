@@ -7,7 +7,7 @@ const banner = {
 
 const isWatch = process.argv.includes("--watch");
 
-await esbuild.build({
+const ctx = await esbuild.context({
   entryPoints: ["src/main.ts"],
   bundle: true,
   outfile: "main.js",
@@ -16,12 +16,13 @@ await esbuild.build({
   target: "es2020",
   banner,
   external: ["obsidian"],
-  watch: isWatch && {
-    onRebuild(error) {
-      if (error) console.error("❌ Rebuild failed:", error);
-      else console.log("✅ Rebuilt");
-    },
-  },
 });
 
-console.log(isWatch ? "👀 Watching for changes…" : "✅ Build complete");
+if (isWatch) {
+  await ctx.watch();
+  console.log("👀 Watching for changes…");
+} else {
+  await ctx.rebuild();
+  await ctx.dispose();
+  console.log("✅ Build complete");
+}
