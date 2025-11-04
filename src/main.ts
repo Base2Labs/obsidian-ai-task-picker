@@ -1,29 +1,139 @@
 import {
   App,
   Editor,
+  EditorPosition,
   MarkdownView,
+  Modal,
   Notice,
   Plugin,
-  TAbstractFile,
   TFile,
-  TFolder,
 } from "obsidian";
+import type { MarkdownFileInfo } from "obsidian";
 import {
   AiTaskPickerSettings,
   DEFAULT_SETTINGS,
   AiTaskPickerSettingTab,
 } from "./settings";
 
+const DEBUG = true;
+const TAG = "[ai-task-picker]";
+function log(...args: unknown[]) { if (DEBUG) console.log(TAG, ...args); }
+function warn(...args: unknown[]) { if (DEBUG) console.warn(TAG, ...args); }
+function error(...args: unknown[]) { if (DEBUG) console.error(TAG, ...args); }
+function group(label: string) { if (DEBUG) console.group(TAG, label); }
+function groupEnd() { if (DEBUG) console.groupEnd(); }
+
 type TaskStatus = "open";
 interface TaskItem {
   id: string;
-  note: string;          // file path
-  text: string;          // task text (no checkbox, no block id)
-  context: string | null;// nearest heading context
-  created: string | null;// YYYY-MM-DD if found
+  note: string;
+  text: string;
+  context: string | null;
+  created: string | null;
   status: TaskStatus;
 }
 
+/** Normalize any incoming block id: trim, remove leading carets/spaces. */
+function normalizeBlockId(raw: unknown): string {
+  return (raw ?? "")
+    .toString()
+    .trim()
+    .replace(/^(\^|\s)+/, "")
+    .trim();
+}
+
+/** Insert text at an exact cursor position without drifting */
+async function insertTextAtCursor(
+  app: App,
+  file: TFile,
+  cursor: EditorPosition,
+  text: string
+): Promise<void> {
+  let view = app.workspace.getActiveViewOfType(MarkdownView);
+  if (!view || !view.file || view.file.path !== file.path) {
+    const leaf = app.workspace.getLeaf(true);
+    await leaf.openFile(file);
+    view = app.workspace.getActiveViewOfType(MarkdownView);
+  }
+  if (!view) throw new Error("Could not get MarkdownView to insert text.");
+
+  const editor = view.editor;
+  const clean = (text ?? "").replace(/^\n+/, "");
+
+  const segments = clean.split("\n");
+  const lineCount = segments.length;
+  const firstLineLen = segments[0]?.length ?? 0;
+  const lastLineLen = segments[lineCount - 1]?.length ?? 0;
+
+  const end: EditorPosition = {
+    line: cursor.line + Math.max(lineCount - 1, 0),
+    ch: lineCount === 1 ? cursor.ch + firstLineLen : lastLineLen,
+  };
+
+  editor.replaceRange(clean, cursor);
+  editor.setCursor(end);
+  editor.focus();
+}
+
+/* ------------------------- Modal ----------------------------------------- */
+class NumberPromptModal extends Modal {
+  private resolve!: (v: number | null) => void;
+  private initial: number;
+  constructor(app: App, initial = 5) {
+    super(app);
+    this.initial = initial;
+  }
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h3", { text: "How many tasks should I surface?" });
+
+    const input = contentEl.createEl("input", {
+      type: "number",
+      attr: { min: "1", step: "1" },
+    }) as HTMLInputElement;
+    input.value = String(this.initial);
+    input.style.margin = "0.5em 0";
+    input.style.padding = "4px";
+    input.style.width = "100%";
+    input.focus();
+    input.select();
+
+    const buttons = contentEl.createDiv();
+    buttons.style.marginTop = "0.75em";
+    buttons.style.display = "flex";
+    buttons.style.gap = "0.5em";
+    buttons.style.justifyContent = "flex-end";
+    const ok = buttons.createEl("button", { text: "OK" });
+    const cancel = buttons.createEl("button", { text: "Cancel" });
+
+    const submit = () => {
+      const n = Number(input.value);
+      if (Number.isFinite(n) && n >= 1) {
+        this.resolve(Math.floor(n));
+        this.close();
+      } else {
+        new Notice("Please enter a number ≥ 1");
+      }
+    };
+    ok.addEventListener("click", submit);
+    cancel.addEventListener("click", () => { this.resolve(null); this.close(); });
+    input.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key === "Enter") submit();
+      if (e.key === "Escape") { this.resolve(null); this.close(); }
+    });
+  }
+  onClose(): void { this.contentEl.empty(); }
+  prompt(): Promise<number | null> {
+    return new Promise((res) => { this.resolve = res; this.open(); });
+  }
+}
+async function promptForCount(app: App, initial = 5): Promise<number | null> {
+  const modal = new NumberPromptModal(app, initial);
+  return modal.prompt();
+}
+
+/* ------------------------- Priority extraction --------------------------- */
 function normalizeHeadingText(s: string): string {
   return (s ?? "")
     .replace(/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\p{Symbol}\s]+/gu, "")
@@ -35,199 +145,231 @@ function normalizeHeadingText(s: string): string {
     .trim()
     .replace(/\s+/g, " ");
 }
-
-function isHeadingLine(line: string): boolean {
-  return /^#{1,6}\s+/.test(line);
-}
 function isHorizontalRule(line: string): boolean {
-  return /^\s*([-*_])\1{2,}\s*$/.test(line);
+  return /^\s*([-*_])\1{2,}\s*$/.test(line ?? "");
 }
 
-function parseCreatedDateFromLine(line: string): string | null {
-  let m = line.match(/created::\s*(\d{4}-\d{2}-\d{2})/);
-  if (m) return m[1];
-  m = line.match(/➕\s*(\d{4}-\d{2}-\d{2})/);
-  if (m) return m[1];
-  return null;
-}
-
-/** Walk a folder recursively and return all markdown files. */
-async function walkMarkdownFilesInFolder(app: App, folderPath: string): Promise<TFile[]> {
-  const root = app.vault.getAbstractFileByPath(folderPath);
-  const out: TFile[] = [];
-
-  async function visit(node: TAbstractFile | null): Promise<void> {
-    if (!node) return;
-    if (node instanceof TFolder) {
-      for (const child of node.children) await visit(child);
-    } else if (node instanceof TFile && node.extension === "md") {
-      out.push(node);
-    }
-  }
-
-  await visit(root);
-  return out;
-}
-
-/** Ensure block IDs on open tasks in a file and collect them. */
-async function ensureBlockIdsAndCollectTasks(app: App, file: TFile): Promise<{
-  tasks: TaskItem[];
-  mutated: boolean;
-  newContent?: string;
-}> {
-  const content = await app.vault.read(file);
-  const lines = content.split("\n");
-  let mutated = false;
-  const tasks: TaskItem[] = [];
-  const existing = new Set<string>();
-
-  // index existing block ids
-  for (const l of lines) {
-    const m = l.match(/\^([A-Za-z0-9\-_]+)\s*$/);
-    if (m) existing.add(m[1]);
-  }
-
-  let currentHeading: string | null = null;
-
-  for (let i = 0; i < lines.length; i++) {
-    let line = lines[i];
-
-    // Track section context
-    if (isHeadingLine(line)) {
-      const m = line.match(/^#{1,6}\s+(.*)$/);
-      currentHeading = m ? m[1].trim() : currentHeading;
-    }
-
-    // Open tasks only
-    const taskMatch = line.match(/^\s*[-*]\s+\[\s*\]\s+(.+)$/);
-    if (!taskMatch) continue;
-
-    // Block id
-    let blockIdMatch = line.match(/\^([A-Za-z0-9\-_]+)\s*$/);
-    let blockId = blockIdMatch ? blockIdMatch[1] : null;
-    if (!blockId) {
-      // generate unique
-      while (true) {
-        const rand = Math.random().toString(36).slice(2, 8);
-        const candidate = `t-${rand}`;
-        if (!existing.has(candidate)) {
-          existing.add(candidate);
-          blockId = candidate;
-          break;
-        }
-      }
-      line = line + "  ^" + blockId;
-      lines[i] = line;
-      mutated = true;
-    }
-
-    const taskText = line
-      .replace(/^\s*[-*]\s+\[\s*\]\s+/, "")
-      .replace(/\^([A-Za-z0-9\-_]+)\s*$/, "")
-      .trim();
-
-    tasks.push({
-      id: blockId!,
-      note: file.path,
-      text: taskText,
-      context: currentHeading,
-      created: parseCreatedDateFromLine(line),
-      status: "open",
-    });
-  }
-
-  return { tasks, mutated, newContent: mutated ? lines.join("\n") : undefined };
-}
-
-/** Collect all open tasks across folders; auto-assign block ids for consistency. */
-async function collectAllOpenTasks(app: App, folders: string[]): Promise<TaskItem[]> {
-  const files: TFile[] = [];
-  for (const f of folders) {
-    const arr = await walkMarkdownFilesInFolder(app, f);
-    files.push(...arr);
-  }
-
-  const all: TaskItem[] = [];
-  for (const file of files) {
-    const { tasks, mutated, newContent } = await ensureBlockIdsAndCollectTasks(app, file);
-    if (mutated && newContent) await app.vault.modify(file, newContent);
-    all.push(...tasks);
-  }
-  return all;
-}
-
-/** Extract the priorities text from the active note under a named heading. */
-async function extractPrioritiesFromActiveNote(app: App, desiredHeading: string): Promise<string> {
-  const file = app.workspace.getActiveFile();
-  if (!file) return "";
-  const content = await app.vault.read(file);
-  const lines = content.split("\n");
+async function extractPrioritiesFromFile(
+  app: App,
+  file: TFile,
+  desiredHeading: string
+): Promise<string> {
+  const content = (await app.vault.read(file)) ?? "";
+  const lines = content.split(/\r?\n/);
 
   let start = -1;
   let startDepth = 0;
 
   for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
+    const l = lines[i] ?? "";
     const m = l.match(/^(#{1,6})\s+(.*)$/);
     if (!m) continue;
-    if (normalizeHeadingText(m[2]) === normalizeHeadingText(desiredHeading)) {
+    const headingDepth = (m[1] ?? "").length;
+    const headingText = m[2] ?? "";
+    if (normalizeHeadingText(headingText) === normalizeHeadingText(desiredHeading)) {
       start = i;
-      startDepth = m[1].length;
+      startDepth = headingDepth;
       break;
     }
   }
-  if (start === -1) return "";
+
+  if (start === -1) {
+    log("Priorities heading not found:", desiredHeading, "in", file.path);
+    return "";
+  }
 
   const buf: string[] = [];
   let seenNonBlank = false;
   for (let j = start + 1; j < lines.length; j++) {
-    const l = lines[j];
+    const l = lines[j] ?? "";
+
     if (isHorizontalRule(l)) break;
+
     const hm = l.match(/^(#{1,6})\s+/);
-    if (hm && parseInt(hm[1].length as unknown as string) <= startDepth) break;
+    const hmDepth = hm ? (hm[1] ?? "").length : 0;
+    if (hm && hmDepth <= startDepth) break;
+
     if (!seenNonBlank && l.trim() === "") continue;
     seenNonBlank = true;
     buf.push(l);
   }
-  while (buf.length && buf[buf.length - 1].trim() === "") buf.pop();
+  while (buf.length > 0 && (buf[buf.length - 1] ?? "").trim() === "") buf.pop();
+
+  const preview = buf.slice(0, 5).join("\n");
+  log(`Priorities extracted from ${file.path}: ${buf.length} lines`, "\nPreview:\n", preview);
   return buf.join("\n");
 }
 
-/** Call OpenAI Chat Completions to rank tasks; returns validated ids. */
+/* ------------------------ Tasks plugin resolver -------------------------- */
+function findTasksPlugin(app: App): any | null {
+  const mgr: any = (app as any).plugins;
+  const plugMap: Record<string, any> = (mgr && mgr.plugins) ? mgr.plugins : {};
+  if (plugMap["obsidian-tasks-plugin"]) return plugMap["obsidian-tasks-plugin"];
+  const byScan = Object.values(plugMap).find((p: any) => {
+    const id = (p?.manifest?.id ?? "").toLowerCase();
+    const name = (p?.manifest?.name ?? "").toLowerCase();
+    return id.includes("tasks") || name.includes("tasks");
+  });
+  return (byScan as any) ?? null;
+}
+function resolveTasksApi(plugin: any): { getAllTasks: () => Promise<any[]> | any[] } | null {
+  if (!plugin) return null;
+
+  const api1 = plugin?.api;
+  if (api1?.getTasks) {
+    log("Using Tasks API shape: plugin.api.getTasks()");
+    return { getAllTasks: () => api1.getTasks() };
+  }
+
+  if (typeof plugin?.getAPI === "function") {
+    const api2 = plugin.getAPI();
+    if (api2?.getTasks) {
+      log("Using Tasks API shape: plugin.getAPI().getTasks()");
+      return { getAllTasks: () => api2.getTasks() };
+    }
+  }
+
+  const v1 = api1?.v1 ?? plugin?.v1 ?? plugin?.apiV1;
+  if (v1?.tasks?.getTasks) {
+    log("Using Tasks API shape: plugin.api.v1.tasks.getTasks()");
+    return { getAllTasks: () => v1.tasks.getTasks() };
+  }
+  if (v1?.getTasks) {
+    log("Using Tasks API shape: plugin.api.v1.getTasks()");
+    return { getAllTasks: () => v1.getTasks() };
+  }
+
+  if (typeof plugin?.getTasks === "function") {
+    log("Using Tasks API shape: plugin.getTasks()");
+    return { getAllTasks: () => plugin.getTasks() };
+  }
+
+  warn("No known Tasks API shape", plugin);
+  return null;
+}
+
+/** Status check for “done” heuristics */
+function isCompletedTask(t: any): boolean {
+  const s = t?.status;
+  const rawStr =
+    (typeof s === "string" ? s : (s?.name ?? s?.type ?? s?.toString?.())) ?? "";
+  const sString = rawStr.toString().toLowerCase();
+
+  const doneRegex = /(done|completed|complete|cancel|🗑|✅|✔|x\b)/i;
+  const bools = [t?.done, t?.completed, t?.isDone, s?.done, s?.isDone];
+  const dates = [t?.doneDate, t?.completedDate, t?.completionDate];
+
+  return bools.some((v) => v === true) || dates.some((d) => !!d) || doneRegex.test(sString);
+}
+
+/** Format created date if available from Tasks plugin shapes */
+function formatCreatedDate(t: any): string | null {
+  const d: any =
+    (t?.createdDate && (t.createdDate.date ?? t.createdDate)) ??
+    t?.created ??
+    null;
+
+  try {
+    if (!d) return null;
+    if (typeof d === "string") {
+      return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+    }
+    if (typeof d?.format === "function") {
+      // e.g., moment/luxon
+      return d.format("YYYY-MM-DD");
+    }
+    if (typeof d === "object" && d.year && d.month && d.day) {
+      const mm = String(d.month).padStart(2, "0");
+      const dd = String(d.day).padStart(2, "0");
+      return `${d.year}-${mm}-${dd}`;
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
+/** Collect open tasks via Tasks plugin */
+async function collectOpenTasksViaTasksPlugin(app: App, settings: AiTaskPickerSettings): Promise<TaskItem[]> {
+  group("Collect via Tasks plugin");
+  try {
+    const plug = findTasksPlugin(app);
+    const api = resolveTasksApi(plug);
+    if (!plug || !api) {
+      throw new Error("Tasks plugin missing or incompatible.");
+    }
+
+    const raw = await api.getAllTasks();
+    const arr: any[] = Array.isArray(raw) ? raw : [];
+    log("Tasks API returned", arr.length, "items");
+
+    const roots = (settings.folders ?? [])
+      .map((p) => (p ?? "").trim().replace(/^\/+|\/+$/g, ""))
+      .filter((s) => s.length > 0);
+
+    log("Folder filters (prefix match):", roots.length ? roots : "(none)");
+
+    const inRoots = (path: string) => {
+      if (!Array.isArray(roots) || roots.length === 0) return true;
+      for (const r of roots) {
+        if (path === r || path.startsWith(r + "/")) return true;
+      }
+      return false;
+    };
+
+    const inFolder = arr.filter((t) => typeof t?.path === "string" && inRoots(String(t.path)));
+    log("Tasks in filtered folders:", inFolder.length);
+
+    const open = inFolder.filter((t) => !isCompletedTask(t));
+    log("Open tasks after status filter:", open.length);
+
+    const out: TaskItem[] = [];
+    for (const t of open) {
+      const existing = normalizeBlockId(t?.blockLink);
+      const id = existing || `t-${Math.random().toString(36).slice(2, 8)}`;
+      out.push({
+        id: normalizeBlockId(id),
+        note: String(t.path),
+        text: String(t?.description ?? "").trim(),
+        context: (t?.parent?.headingText ?? t?.parent?.heading ?? null) as string | null,
+        created: formatCreatedDate(t),
+        status: "open",
+      });
+    }
+
+    log("Final TaskItem count:", out.length);
+    return out;
+  } finally {
+    groupEnd();
+  }
+}
+
+/* ----------------------- OpenAI ranking ---------------------------------- */
 async function callOpenAIRank(
   settings: AiTaskPickerSettings,
   prioritiesText: string,
   tasks: TaskItem[],
-  n: number,
+  n: number
 ): Promise<string[]> {
-  if (!settings.openaiApiKey) throw new Error("OpenAI API key is not set in settings.");
-  const system = settings.rankingPrompt || DEFAULT_SETTINGS.rankingPrompt;
+  if (!settings.openaiApiKey) throw new Error("OpenAI API key is not set.");
 
-  const MAX_LEN = 240;
   const payload = {
-    priorities_text: prioritiesText || "",
-    tasks: tasks.map((t) => ({
-      id: t.id,
-      note: t.note,
-      text: (t.text ?? "").slice(0, MAX_LEN),
-      context: t.context ?? null,
-      created: t.created ?? null,
-      status: t.status ?? "open",
-    })),
+    priorities_text: prioritiesText ?? "",
+    tasks,
     max_tasks: n,
   };
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${settings.openaiApiKey}`,
+      Authorization: `Bearer ${settings.openaiApiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model: settings.model || "gpt-4o-mini",
       response_format: { type: "json_object" },
       messages: [
-        { role: "system", content: system },
+        { role: "system", content: settings.rankingPrompt },
         { role: "user", content: JSON.stringify(payload) },
       ],
     }),
@@ -235,27 +377,25 @@ async function callOpenAIRank(
 
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
-    throw new Error(`OpenAI error ${res.status}: ${txt || res.statusText}`);
+    throw new Error(txt || `OpenAI error ${res.status}`);
   }
 
-  const json = await res.json();
-  const content: string = json?.choices?.[0]?.message?.content ?? "";
-  let obj: any;
+  const json = await res.json().catch(() => null);
+  const content = json?.choices?.[0]?.message?.content ?? "";
+  let parsed: any = {};
   try {
-    obj = JSON.parse(content);
-  } catch {
-    const cleaned = content.replace(/^\s*```(?:json)?/i, "").replace(/```\s*$/i, "").trim();
-    obj = JSON.parse(cleaned);
-  }
+    parsed = JSON.parse(content.replace(/^\s*```(?:json)?/i, "").replace(/```\s*$/i, "").trim());
+  } catch { /* ignore parse error; will fall back to empty */ }
 
-  const ids: string[] = Array.isArray(obj?.ranked_task_ids)
-    ? obj.ranked_task_ids.map((x: unknown) => String(x))
+  const ids: string[] = Array.isArray(parsed?.ranked_task_ids)
+    ? parsed.ranked_task_ids.map((x: unknown) => String(x))
     : [];
 
-  const allowed = new Set(tasks.map((t) => t.id));
-  return ids.filter((id) => allowed.has(id)).slice(0, n);
+  log("Ranked ids:", ids);
+  return ids.slice(0, Math.max(0, n | 0));
 }
 
+/* --------------------------------- Plugin -------------------------------- */
 export default class AiTaskPickerPlugin extends Plugin {
   settings: AiTaskPickerSettings = DEFAULT_SETTINGS;
 
@@ -266,48 +406,52 @@ export default class AiTaskPickerPlugin extends Plugin {
     this.addCommand({
       id: "insert-ranked-tasks-at-cursor",
       name: "AI: Insert ranked tasks at cursor",
-      editorCallback: async (editor: Editor, view: MarkdownView | null) => {
+      editorCallback: async (editor: Editor, ctx: MarkdownView | MarkdownFileInfo) => {
         try {
-          if (!view?.file) {
-            new Notice("Open a note first.");
-            return;
-          }
+          const targetFile: TFile | null =
+            (ctx as MarkdownFileInfo)?.file ??
+            (ctx as MarkdownView)?.file ??
+            this.app.workspace.getActiveFile();
 
-          const nStr = await this.app.workspace.prompt?.("How many tasks should I surface?", "5");
-          const n = Math.max(1, parseInt((nStr ?? "5"), 10) || 5);
+          if (!targetFile) { new Notice("Open a note first."); return; }
 
-          new Notice("Collecting tasks…");
-          const tasks = await collectAllOpenTasks(this.app, this.settings.folders);
+          const savedCursor = editor.getCursor();
+
+          const n = await promptForCount(this.app, 5);
+          if (n == null) return;
+
+          new Notice("Collecting open tasks…");
+          const tasks = await collectOpenTasksViaTasksPlugin(this.app, this.settings);
+          if (!tasks.length) { new Notice("No open tasks found."); return; }
 
           new Notice("Reading priorities…");
-          const priorities = await extractPrioritiesFromActiveNote(this.app, this.settings.prioritiesHeading);
+          const priorities = await extractPrioritiesFromFile(this.app, targetFile, this.settings.prioritiesHeading);
+          if (!priorities.trim()) { new Notice("No priorities found."); return; }
 
           new Notice("Ranking with OpenAI…");
           const rankedIds = await callOpenAIRank(this.settings, priorities, tasks, n);
 
-          const byId = new Map<string, TaskItem>(tasks.map((t) => [t.id, t]));
+          const byId = new Map<string, TaskItem>(tasks.map((t) => [normalizeBlockId(t.id), t]));
           const lines: string[] = [];
           for (const id of rankedIds) {
-            const t = byId.get(id);
-            if (t) lines.push(`![[${t.note}#^${t.id}]]`);
+            const t = byId.get(normalizeBlockId(id));
+            if (!t) continue;
+            const cleanId = normalizeBlockId(t.id);
+            const cleanPath = t.note.replace(/\.md$/i, "");
+            lines.push(`![[${cleanPath}#^${cleanId}]]`);
           }
-          if (lines.length === 0) {
-            new Notice("No tasks returned.");
-            return;
-          }
+          if (lines.length === 0) { new Notice("No tasks returned."); return; }
 
-          const text = lines.join("\n") + "\n";
-          editor.replaceSelection(text);
+          await insertTextAtCursor(this.app, targetFile, savedCursor, lines.join("\n") + "\n");
           new Notice("Inserted ranked task embeds ✅");
-        } catch (e: any) {
-          console.error(e);
-          new Notice(`AI Task Picker error: ${e?.message ?? e}`);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          error("Command failure:", e);
+          new Notice(`AI Task Picker error: ${msg}`);
         }
       },
     });
   }
-
-  async onunload(): Promise<void> {}
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
