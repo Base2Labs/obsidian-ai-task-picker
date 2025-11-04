@@ -4,8 +4,8 @@
   "version": "0.4.1",
   "minAppVersion": "1.5.0",
   "description": "Ranks your Obsidian Tasks using weekly priorities and inserts inline task embeds at the cursor.",
-  "author": "Your Name",
-  "authorUrl": "https://github.com/yourname",
+  "author": "Romulo Velasquez",
+  "authorUrl": "https://github.com/base2labs",
   "isDesktopOnly": false,
   "dependencies": ["obsidian-tasks-plugin"]
 }
