@@ -15,13 +15,9 @@ import {
   AiTaskPickerSettingTab,
 } from "./settings";
 
-const DEBUG = true;
-const TAG = "[ai-task-picker]";
-function log(...args: unknown[]) { if (DEBUG) console.log(TAG, ...args); }
-function warn(...args: unknown[]) { if (DEBUG) console.warn(TAG, ...args); }
-function error(...args: unknown[]) { if (DEBUG) console.error(TAG, ...args); }
-function group(label: string) { if (DEBUG) console.group(TAG, label); }
-function groupEnd() { if (DEBUG) console.groupEnd(); }
+const DEBUG = false;
+function warn(...args: unknown[]) { if (DEBUG) console.warn("[ai-task-picker]", ...args); }
+function error(...args: unknown[]) { console.error("[ai-task-picker]", ...args); }
 
 /* ---------------- Types ---------------- */
 type TaskStatus = "open";
@@ -45,18 +41,26 @@ function normalizeBlockId(raw: unknown): string {
 function ensureMd(path: string): string {
   return /\.md$/i.test(path) ? path : `${path}.md`;
 }
-function insertTextAtomically(editor: Editor, cursor: EditorPosition, text: string): void {
-  const clean = (text ?? "").replace(/^\n+/, ""); // avoid accidental leading blank lines
-  editor.setSelection(cursor, cursor);
-  editor.replaceSelection(clean);
-
-  const lines = clean.split("\n");
-  const end: EditorPosition = {
-    line: cursor.line + Math.max(lines.length - 1, 0),
-    ch: lines.length === 1 ? cursor.ch + (lines[0]?.length ?? 0) : (lines[lines.length - 1]?.length ?? 0),
-  };
-  editor.setCursor(end);
-  editor.focus();
+function insertTextAtCursor(editor: Editor, cursorPosition: EditorPosition, text: string): void {
+  const lineCount = editor.lineCount();
+  const validatedLine = Math.min(Math.max(0, cursorPosition.line), lineCount - 1);
+  const lineLength = editor.getLine(validatedLine).length;
+  const validatedChar = Math.min(Math.max(0, cursorPosition.ch), lineLength);
+  
+  const insertPosition: EditorPosition = { line: validatedLine, ch: validatedChar };
+  editor.replaceRange(text, insertPosition);
+  
+  // Move cursor to end of inserted content and center on screen
+  const insertedLines = text.split("\n");
+  const endLine = validatedLine + insertedLines.length - 1;
+  const lastLine = insertedLines[insertedLines.length - 1] ?? "";
+  const endChar = insertedLines.length === 1 
+    ? validatedChar + text.length 
+    : lastLine.length;
+  const endPosition: EditorPosition = { line: endLine, ch: endChar };
+  
+  editor.setCursor(endPosition);
+  editor.scrollIntoView({ from: endPosition, to: endPosition }, true);
 }
 
 /* ---------------- Modal ---------------- */
@@ -144,11 +148,11 @@ async function extractPrioritiesFromFile(
   let startDepth = 0;
 
   for (let i = 0; i < lines.length; i++) {
-    const l = lines[i] ?? "";
-    const m = l.match(/^(#{1,6})\s+(.*)$/);
-    if (!m) continue;
-    const hashes: string = m[1] ?? "";
-    const headingText: string = m[2] ?? "";
+    const line = lines[i] ?? "";
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (!headingMatch) continue;
+    const hashes = headingMatch[1] ?? "";
+    const headingText = headingMatch[2] ?? "";
     if (normalizeHeadingText(headingText) === normalizeHeadingText(desiredHeading)) {
       start = i;
       startDepth = hashes.length;
@@ -156,115 +160,135 @@ async function extractPrioritiesFromFile(
     }
   }
 
-  if (start === -1) {
-    log("Priorities heading not found:", desiredHeading, "in", file.path);
-    return "";
-  }
+  if (start === -1) return "";
 
-  const buf: string[] = [];
+  const buffer: string[] = [];
   let seenNonBlank = false;
   for (let j = start + 1; j < lines.length; j++) {
-    const l = lines[j] ?? "";
+    const line = lines[j] ?? "";
 
-    if (isHorizontalRule(l)) break;
+    if (isHorizontalRule(line)) break;
 
-    const hm = l.match(/^(#{1,6})\s+/);
-    const hmHashes: string = (hm?.[1] ?? "");
-    const hmDepth = hmHashes.length;
-    if (hm && hmDepth <= startDepth) break;
+    const headingMatch = line.match(/^(#{1,6})\s+/);
+    if (headingMatch) {
+      const hashes = headingMatch[1] ?? "";
+      const headingDepth = hashes.length;
+      if (headingDepth <= startDepth) break;
+    }
 
-    if (!seenNonBlank && l.trim() === "") continue;
+    if (!seenNonBlank && line.trim() === "") continue;
     seenNonBlank = true;
-    buf.push(l);
+    buffer.push(line);
   }
-  while (buf.length > 0 && (buf[buf.length - 1] ?? "").trim() === "") buf.pop();
-
-  const preview = buf.slice(0, 5).join("\n");
-  log(`Priorities extracted from ${file.path}: ${buf.length} lines`, "\nPreview:\n", preview);
-  return buf.join("\n");
+  while (buffer.length > 0 && (buffer[buffer.length - 1] ?? "").trim() === "") {
+    buffer.pop();
+  }
+  return buffer.join("\n");
 }
 
 /* --------------- Tasks plugin resolver (strict) --------------- */
 function findTasksPlugin(app: App): any | null {
-  const mgr: any = (app as any).plugins;
-  const plugMap: Record<string, any> = (mgr && mgr.plugins) ? mgr.plugins : {};
-  if (plugMap["obsidian-tasks-plugin"]) return plugMap["obsidian-tasks-plugin"];
-  const byScan = Object.values(plugMap).find((p: any) => {
-    const id = (p?.manifest?.id ?? "").toLowerCase();
-    const name = (p?.manifest?.name ?? "").toLowerCase();
-    return id.includes("tasks") || name.includes("tasks");
+  const pluginManager: any = (app as any).plugins;
+  const pluginMap: Record<string, any> = (pluginManager?.plugins) ? pluginManager.plugins : {};
+  
+  if (pluginMap["obsidian-tasks-plugin"]) {
+    return pluginMap["obsidian-tasks-plugin"];
+  }
+  
+  const foundPlugin = Object.values(pluginMap).find((plugin: any) => {
+    const pluginId = (plugin?.manifest?.id ?? "").toLowerCase();
+    const pluginName = (plugin?.manifest?.name ?? "").toLowerCase();
+    return pluginId.includes("tasks") || pluginName.includes("tasks");
   });
-  return (byScan as any) ?? null;
+  
+  return foundPlugin ?? null;
 }
 function resolveTasksApi(plugin: any): { getAllTasks: () => Promise<any[]> | any[] } | null {
   if (!plugin) return null;
 
-  const api1 = plugin?.api;
-  if (api1?.getTasks) {
-    log("Using Tasks API shape: plugin.api.getTasks()");
-    return { getAllTasks: () => api1.getTasks() };
+  const directApi = plugin?.api;
+  if (directApi?.getTasks) {
+    return { getAllTasks: () => directApi.getTasks() };
   }
 
   if (typeof plugin?.getAPI === "function") {
-    const api2 = plugin.getAPI();
-    if (api2?.getTasks) {
-      log("Using Tasks API shape: plugin.getAPI().getTasks()");
-      return { getAllTasks: () => api2.getTasks() };
+    const factoryApi = plugin.getAPI();
+    if (factoryApi?.getTasks) {
+      return { getAllTasks: () => factoryApi.getTasks() };
     }
   }
 
-  const v1 = api1?.v1 ?? plugin?.v1 ?? plugin?.apiV1;
-  if (v1?.tasks?.getTasks) {
-    log("Using Tasks API shape: plugin.api.v1.tasks.getTasks()");
-    return { getAllTasks: () => v1.tasks.getTasks() };
+  const legacyApi = directApi?.v1 ?? plugin?.v1 ?? plugin?.apiV1;
+  if (legacyApi?.tasks?.getTasks) {
+    return { getAllTasks: () => legacyApi.tasks.getTasks() };
   }
-  if (v1?.getTasks) {
-    log("Using Tasks API shape: plugin.api.v1.getTasks()");
-    return { getAllTasks: () => v1.getTasks() };
+  if (legacyApi?.getTasks) {
+    return { getAllTasks: () => legacyApi.getTasks() };
   }
 
   if (typeof plugin?.getTasks === "function") {
-    log("Using Tasks API shape: plugin.getTasks()");
     return { getAllTasks: () => plugin.getTasks() };
   }
 
-  warn("No known Tasks API shape", plugin);
+  warn("No known Tasks API shape found", plugin);
   return null;
 }
 
 /* -------------------- Task filters & formats ------------------- */
-function isCompletedTask(t: any): boolean {
-  const s = t?.status;
-  const rawStr =
-    (typeof s === "string" ? s : (s?.name ?? s?.type ?? s?.toString?.())) ?? "";
-  const sString = rawStr.toString().toLowerCase();
+function isCompletedTask(task: any): boolean {
+  if (!task) return false;
+  
+  const status = task.status;
+  const statusString = (typeof status === "string" 
+    ? status 
+    : (status?.name ?? status?.type ?? status?.toString?.())) ?? "";
+  const normalizedStatus = statusString.toString().toLowerCase();
 
-  const doneRegex = /(done|completed|complete|cancel|🗑|✅|✔|x\b)/i;
-  const bools = [t?.done, t?.completed, t?.isDone, s?.done, s?.isDone];
-  const dates = [t?.doneDate, t?.completedDate, t?.completionDate];
+  const completionPattern = /(done|completed|complete|cancel|🗑|✅|✔|x\b)/i;
+  const booleanFlags = [
+    task.done, 
+    task.completed, 
+    task.isDone, 
+    status?.done, 
+    status?.isDone
+  ];
+  const completionDates = [
+    task.doneDate, 
+    task.completedDate, 
+    task.completionDate
+  ];
 
-  return bools.some((v) => v === true) || dates.some((d) => !!d) || doneRegex.test(sString);
+  return booleanFlags.some((flag) => flag === true) 
+    || completionDates.some((date) => !!date) 
+    || completionPattern.test(normalizedStatus);
 }
-function formatCreatedDate(t: any): string | null {
-  const d: any =
-    (t?.createdDate && ((t.createdDate as any).date ?? t.createdDate)) ??
-    t?.created ??
+function formatCreatedDate(task: any): string | null {
+  if (!task) return null;
+  
+  const dateValue: any =
+    (task.createdDate && ((task.createdDate as any).date ?? task.createdDate)) ??
+    task.created ??
     null;
 
   try {
-    if (!d) return null;
-    if (typeof d === "string") {
-      return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+    if (!dateValue) return null;
+    
+    if (typeof dateValue === "string") {
+      return /^\d{4}-\d{2}-\d{2}$/.test(dateValue) ? dateValue : null;
     }
-    if (typeof (d as any)?.format === "function") {
-      return (d as any).format("YYYY-MM-DD");
+    
+    if (typeof (dateValue as any)?.format === "function") {
+      return (dateValue as any).format("YYYY-MM-DD");
     }
-    if (typeof d === "object" && (d as any).year && (d as any).month && (d as any).day) {
-      const mm = String((d as any).month).padStart(2, "0");
-      const dd = String((d as any).day).padStart(2, "0");
-      return `${(d as any).year}-${mm}-${dd}`;
+    
+    if (typeof dateValue === "object" && dateValue.year && dateValue.month && dateValue.day) {
+      const month = String(dateValue.month).padStart(2, "0");
+      const day = String(dateValue.day).padStart(2, "0");
+      return `${dateValue.year}-${month}-${day}`;
     }
-  } catch {}
+  } catch (err) {
+    // Silently fail and return null
+  }
   return null;
 }
 
@@ -283,7 +307,7 @@ async function waitForBlockIndexed(app: App, file: TFile, blockId: string, timeo
 }
 
 /** Ensure or create a block id for a task that resides in a BACKGROUND file. */
-async function ensureBlockIdInBackgroundFile(app: App, task: any): Promise<string> {
+async function ensureBlockIdInBackgroundFile(app: App, task: any, activeFile: TFile | null): Promise<string> {
   const path = typeof task?.path === "string" ? task.path : "";
   const rawLine = (task?.lineNumber ?? task?.lineNr ?? task?.line) as number | undefined;
 
@@ -296,6 +320,12 @@ async function ensureBlockIdInBackgroundFile(app: App, task: any): Promise<strin
 
   const file = app.vault.getAbstractFileByPath(path);
   if (!(file instanceof TFile)) return `t-${Math.random().toString(36).slice(2, 8)}`;
+  
+  // SAFETY: Never modify the active file
+  if (activeFile && file.path === activeFile.path) {
+    warn("Refusing to modify active file", file.path);
+    return `t-${Math.random().toString(36).slice(2, 8)}`;
+  }
 
   const lineNumber = Math.max(0, rawLine);
   const content = await app.vault.read(file);
@@ -303,37 +333,40 @@ async function ensureBlockIdInBackgroundFile(app: App, task: any): Promise<strin
   const idx = Math.min(Math.max(0, lineNumber), Math.max(0, lines.length - 1));
   const current = lines[idx] ?? "";
 
-  const m = current.match(/\^([A-Za-z0-9\-_]+)\s*$/);
-  if (m) {
-    const id = m[1] ?? "";
-    if (id) {
-      await waitForBlockIndexed(app, file, id, 1000);
-      return id;
+  const blockIdMatch = current.match(/\^([A-Za-z0-9\-_]+)\s*$/);
+  if (blockIdMatch) {
+    const existingId = blockIdMatch[1] ?? "";
+    if (existingId) {
+      await waitForBlockIndexed(app, file, existingId, 1000);
+      return existingId;
     }
   }
 
   const existingIds = new Set<string>();
-  for (const l of lines) {
-    const idm = (l ?? "").match(/\^([A-Za-z0-9\-_]+)\s*$/);
-    if (idm) {
-      const found = idm[1] ?? "";
-      if (found) existingIds.add(found);
+  for (const line of lines) {
+    const blockIdMatch = (line ?? "").match(/\^([A-Za-z0-9\-_]+)\s*$/);
+    if (blockIdMatch) {
+      const foundId = blockIdMatch[1] ?? "";
+      if (foundId) existingIds.add(foundId);
     }
   }
-  let id = "";
-  while (!id) {
-    const cand = `t-${Math.random().toString(36).slice(2, 8)}`;
-    if (!existingIds.has(cand)) id = cand;
+  let generatedId = "";
+  while (!generatedId) {
+    const candidate = `t-${Math.random().toString(36).slice(2, 8)}`;
+    if (!existingIds.has(candidate)) {
+      generatedId = candidate;
+    }
   }
 
-  lines[idx] = current.replace(/\s*$/, "") + "  ^" + id;
+  lines[idx] = current.replace(/\s*$/, "") + "  ^" + generatedId;
   await app.vault.modify(file, lines.join("\n"));
-  log("Appended block id in background file via vault", { path, lineNumber: idx, id });
 
-  const ok = await waitForBlockIndexed(app, file, id, 2000);
-  if (!ok) warn("Block id not indexed within timeout; embed may briefly appear unresolved", { path, id });
+  const isIndexed = await waitForBlockIndexed(app, file, generatedId, 2000);
+  if (!isIndexed) {
+    warn("Block id not indexed within timeout; embed may briefly appear unresolved", { path, id: generatedId });
+  }
 
-  return id;
+  return generatedId;
 }
 
 /* ------------- Collect tasks (excluding active note) ------------- */
@@ -342,58 +375,47 @@ async function collectOpenTasksViaTasksPlugin(
   settings: AiTaskPickerSettings,
   activeFile: TFile | null,
 ): Promise<TaskItem[]> {
-  group("Collect via Tasks plugin");
-  try {
-    const plug = findTasksPlugin(app);
-    const api = resolveTasksApi(plug);
-    if (!plug || !api) throw new Error("Tasks plugin missing or incompatible.");
-
-    const raw = await api.getAllTasks();
-    const arr: any[] = Array.isArray(raw) ? raw : [];
-    log("Tasks API returned", arr.length, "items");
-
-    const roots = (settings.folders ?? [])
-      .map((p) => (p ?? "").trim().replace(/^\/+|\/+$/g, ""))
-      .filter((s) => s.length > 0);
-    log("Folder filters (prefix match):", roots.length ? roots : "(none)");
-
-    const inRoots = (path: string) => {
-      if (!Array.isArray(roots) || roots.length === 0) return true;
-      for (const r of roots) {
-        if (path === r || path.startsWith(r + "/")) return true;
-      }
-      return false;
-    };
-
-    const activePath = activeFile?.path ?? null;
-
-    const filtered = arr.filter((t) => {
-      const p = String(t?.path ?? "");
-      return p && inRoots(p) && (!activePath || p !== activePath); // <<< exclude active note
-    });
-    log("Tasks in filtered folders (excluding active note):", filtered.length);
-
-    const open = filtered.filter((t) => !isCompletedTask(t));
-    log("Open tasks after status filter:", open.length);
-
-    const out: TaskItem[] = [];
-    for (const t of open) {
-      const id = await ensureBlockIdInBackgroundFile(app, t);
-      out.push({
-        id: normalizeBlockId(id),
-        note: ensureMd(String(t.path)),
-        text: String(t?.description ?? "").trim(),
-        context: (t?.parent?.headingText ?? t?.parent?.heading ?? null) as string | null,
-        created: formatCreatedDate(t),
-        status: "open",
-      });
-    }
-
-    log("Final TaskItem count:", out.length);
-    return out;
-  } finally {
-    groupEnd();
+  const tasksPlugin = findTasksPlugin(app);
+  const tasksApi = resolveTasksApi(tasksPlugin);
+  if (!tasksPlugin || !tasksApi) {
+    throw new Error("Tasks plugin missing or incompatible.");
   }
+
+  const allTasks = await tasksApi.getAllTasks();
+  const tasksArray: any[] = Array.isArray(allTasks) ? allTasks : [];
+
+  const folderRoots = (settings.folders ?? [])
+    .map((folderPath) => (folderPath ?? "").trim().replace(/^\/+|\/+$/g, ""))
+    .filter((folderPath) => folderPath.length > 0);
+
+  const isInConfiguredFolders = (taskPath: string) => {
+    if (folderRoots.length === 0) return true;
+    return folderRoots.some((root) => taskPath === root || taskPath.startsWith(root + "/"));
+  };
+
+  const activeFilePath = activeFile?.path ?? null;
+
+  const filteredTasks = tasksArray.filter((task) => {
+    const taskPath = String(task?.path ?? "");
+    return taskPath && isInConfiguredFolders(taskPath) && taskPath !== activeFilePath;
+  });
+
+  const openTasks = filteredTasks.filter((task) => !isCompletedTask(task));
+
+  const taskItems: TaskItem[] = [];
+  for (const task of openTasks) {
+    const blockId = await ensureBlockIdInBackgroundFile(app, task, activeFile);
+    taskItems.push({
+      id: normalizeBlockId(blockId),
+      note: ensureMd(String(task.path)),
+      text: String(task?.description ?? "").trim(),
+      context: (task?.parent?.headingText ?? task?.parent?.heading ?? null) as string | null,
+      created: formatCreatedDate(task),
+      status: "open",
+    });
+  }
+
+  return taskItems;
 }
 
 /* ------------------- OpenAI ranking (strict) ------------------ */
@@ -443,12 +465,11 @@ async function callOpenAIRank(
     parsed = JSON.parse(content.replace(/^\s*```(?:json)?/i, "").replace(/```\s*$/i, "").trim());
   } catch { /* ignore */ }
 
-  const ids: string[] = Array.isArray(parsed?.ranked_task_ids)
-    ? parsed.ranked_task_ids.map((x: unknown) => String(x))
+  const rankedIds: string[] = Array.isArray(parsed?.ranked_task_ids)
+    ? parsed.ranked_task_ids.map((id: unknown) => String(id))
     : [];
 
-  log("Ranked ids:", ids);
-  return ids.slice(0, Math.max(0, n | 0));
+  return rankedIds.slice(0, Math.max(0, n | 0));
 }
 
 /* ----------------------------- Plugin ----------------------------- */
@@ -470,49 +491,67 @@ export default class AiTaskPickerPlugin extends Plugin {
             this.app.workspace.getActiveFile();
           if (!targetFile) { new Notice("Open a note first."); return; }
 
+          // Save cursor position and document state IMMEDIATELY before showing modal
           const savedCursor = editor.getCursor();
+          const initialContent = editor.getValue();
 
-          const n = await promptForCount(this.app, 5);
-          if (n == null) return;
+          const taskCount = await promptForCount(this.app, 5);
+          if (taskCount == null) return;
 
           new Notice("Collecting open tasks…");
           const tasks = await collectOpenTasksViaTasksPlugin(this.app, this.settings, targetFile);
-          if (!tasks.length) { new Notice("No open tasks found."); return; }
+          
+          // Restore content if unexpectedly modified during task collection
+          if (editor.getValue() !== initialContent) {
+            warn("Active file was modified during task collection! Restoring original content.");
+            editor.setValue(initialContent);
+          }
+          
+          if (!tasks.length) {
+            new Notice("No open tasks found.");
+            return;
+          }
 
           new Notice("Reading priorities…");
           const priorities = await extractPrioritiesFromFile(this.app, targetFile, this.settings.prioritiesHeading);
-          if (!priorities.trim()) { new Notice("No priorities found."); return; }
+          if (!priorities.trim()) {
+            new Notice("No priorities found.");
+            return;
+          }
 
           new Notice("Ranking with OpenAI…");
-          const rankedIds = await callOpenAIRank(this.settings, priorities, tasks, n);
+          const rankedIds = await callOpenAIRank(this.settings, priorities, tasks, taskCount);
 
-          const byId = new Map<string, TaskItem>(tasks.map((t) => [normalizeBlockId(t.id), t]));
-          const embeds: string[] = [];
-          for (const idRaw of rankedIds) {
-            const id = normalizeBlockId(idRaw);
-            const t = byId.get(id);
-            if (!t) continue;
+          const tasksById = new Map<string, TaskItem>(
+            tasks.map((task) => [normalizeBlockId(task.id), task])
+          );
+          
+          const taskEmbeds: string[] = [];
+          for (const rawId of rankedIds) {
+            const blockId = normalizeBlockId(rawId);
+            const task = tasksById.get(blockId);
+            if (!task) continue;
 
-            // Confirm the block is indexed in its (background) file
-            const target = this.app.vault.getAbstractFileByPath(t.note);
-            if (target instanceof TFile) {
-              const cache = this.app.metadataCache.getFileCache(target);
-              const has = !!cache?.blocks && Object.prototype.hasOwnProperty.call(cache.blocks, id);
-              if (!has) {
-                warn("Skipping embed; block id not yet indexed", { path: t.note, id });
+            // Confirm the block is indexed in its background file
+            const targetFile = this.app.vault.getAbstractFileByPath(task.note);
+            if (targetFile instanceof TFile) {
+              const fileCache = this.app.metadataCache.getFileCache(targetFile);
+              const isBlockIndexed = !!fileCache?.blocks && Object.prototype.hasOwnProperty.call(fileCache.blocks, blockId);
+              if (!isBlockIndexed) {
+                warn("Skipping embed; block id not yet indexed", { path: task.note, id: blockId });
                 continue;
               }
             }
 
-            embeds.push(`![[${ensureMd(t.note)}#^${id}]]`);
+            taskEmbeds.push(`![[${ensureMd(task.note)}#^${blockId}]]`);
           }
 
-          if (embeds.length === 0) {
+          if (taskEmbeds.length === 0) {
             new Notice("No tasks returned (or not yet indexed). Try again shortly.");
             return;
           }
 
-          insertTextAtomically(editor, savedCursor, embeds.join("\n") + "\n");
+          insertTextAtCursor(editor, savedCursor, taskEmbeds.join("\n") + "\n");
           new Notice("Inserted ranked task embeds ✅");
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
