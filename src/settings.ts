@@ -1,7 +1,7 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 
 export interface AiTaskPickerSettings {
-  folders: string[];
+  folders: string[];          // whitelist (prefix match) for task paths
   openaiApiKey: string;
   model: string;
   prioritiesHeading: string;
@@ -28,7 +28,7 @@ export const DEFAULT_SETTINGS: AiTaskPickerSettings = {
 };
 
 export class AiTaskPickerSettingTab extends PluginSettingTab {
-  plugin: any;
+  plugin: { settings: AiTaskPickerSettings; saveSettings: () => Promise<void> };
 
   constructor(app: App, plugin: any) {
     super(app, plugin);
@@ -42,13 +42,13 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Folders to scan")
-      .setDesc("One path per line (e.g., Daily Notes, 1 Projects).")
+      .setDesc("One path per line (prefix match). Example:\nDaily Notes\n1 Projects")
       .addTextArea((ta) => {
         ta.setValue(this.plugin.settings.folders.join("\n"))
           .onChange(async (v) => {
             this.plugin.settings.folders = v
               .split("\n")
-              .map((s: string) => s.trim())
+              .map((s) => s.trim().replace(/^\/+|\/+$/g, ""))
               .filter(Boolean);
             await this.plugin.saveSettings();
           });
@@ -57,7 +57,7 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Priorities heading")
-      .setDesc("The section heading in the active note to read priorities from.")
+      .setDesc("Heading in the active note to read priorities from.")
       .addText((t) =>
         t
           .setPlaceholder("🎯 Next Week's Priorities")
@@ -89,18 +89,19 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
           .setPlaceholder("gpt-4o-mini")
           .setValue(this.plugin.settings.model)
           .onChange(async (v) => {
-            this.plugin.settings.model = v.trim() || "gpt-4o-mini";
+            this.plugin.settings.model = (v || "").trim() || "gpt-4o-mini";
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
       .setName("Ranking Prompt (System)")
-      .setDesc("Customize the system prompt used to rank tasks. Clear to reset to default.")
+      .setDesc("Customize the system prompt used to rank tasks. Clear to reset.")
       .addTextArea((ta) => {
         ta.setValue(this.plugin.settings.rankingPrompt)
           .onChange(async (v) => {
-            this.plugin.settings.rankingPrompt = v.trim() || DEFAULT_SETTINGS.rankingPrompt;
+            this.plugin.settings.rankingPrompt =
+              (v || "").trim() || DEFAULT_SETTINGS.rankingPrompt;
             await this.plugin.saveSettings();
           });
         ta.inputEl.rows = 8;
