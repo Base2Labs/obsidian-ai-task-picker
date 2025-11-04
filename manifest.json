@@ -1,11 +1,13 @@
 {
   "id": "ai-task-picker",
   "name": "AI Task Picker",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.5.0",
   "description": "Ranks your Obsidian Tasks using weekly priorities and inserts inline task embeds at the cursor.",
   "author": "Romulo Velasquez",
   "authorUrl": "https://github.com/base2labs",
   "isDesktopOnly": false,
-  "dependencies": ["obsidian-tasks-plugin"]
+  "dependencies": [
+    "obsidian-tasks-plugin"
+  ]
 }
