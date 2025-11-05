@@ -55,5 +55,5 @@ export async function callOpenAIRank(
     ? parsed.ranked_task_ids.map((id: unknown) => String(id))
     : [];
 
-  return rankedIds.slice(0, Math.max(0, maxTasks | 0));
+  return rankedIds.slice(0, maxTasks);
 }
