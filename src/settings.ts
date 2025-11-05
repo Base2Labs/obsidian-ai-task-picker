@@ -40,9 +40,17 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "AI Task Picker Settings" });
 
+    // Overview description
+    const intro = containerEl.createDiv();
+    intro.style.marginBottom = "1.5em";
+    intro.style.lineHeight = "1.6";
+    intro.createEl("p", { 
+      text: "This plugin ranks tasks from the Obsidian Tasks plugin using OpenAI, based on your priorities. Configure the folders to scan, the heading to extract priorities from, and customize the AI ranking behavior."
+    });
+
     new Setting(containerEl)
       .setName("Folders to scan")
-      .setDesc("One path per line (prefix match). Example:\nDaily Notes\n1 Projects")
+      .setDesc("Specify which folders contain tasks to rank. Enter one folder path per line (prefix matching). The plugin will search these folders and their subfolders for tasks. The active note is always excluded to prevent self-references.\n\nExample:\nDaily Notes\n1 Projects\n3 Areas/Work")
       .addTextArea((ta) => {
         ta.setValue(this.plugin.settings.folders.join("\n"))
           .onChange(async (v) => {
@@ -57,7 +65,7 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Priorities heading")
-      .setDesc("Heading in the active note to read priorities from.")
+      .setDesc("The heading in your active note where you've written your current priorities. The plugin will extract the content under this heading and send it to OpenAI to guide task ranking. Supports emojis and punctuation variations.\n\nExample: 🎯 Next Week's Priorities")
       .addText((t) =>
         t
           .setPlaceholder("🎯 Next Week's Priorities")
@@ -70,7 +78,7 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("OpenAI API Key")
-      .setDesc("Stored locally in this vault's config.")
+      .setDesc("Your OpenAI API key for task ranking. Get one at platform.openai.com/api-keys. This key is stored locally in your vault's plugin configuration and is never sent anywhere except directly to OpenAI's API.")
       .addText((t) =>
         t
           .setPlaceholder("sk-...")
@@ -83,7 +91,7 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("OpenAI Model")
-      .setDesc("Example: gpt-4o-mini")
+      .setDesc("The OpenAI model to use for ranking. Recommended: gpt-4o-mini (fast and cost-effective) or gpt-4o (more capable). See platform.openai.com/docs/models for available models.")
       .addText((t) =>
         t
           .setPlaceholder("gpt-4o-mini")
@@ -96,7 +104,7 @@ export class AiTaskPickerSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Ranking Prompt (System)")
-      .setDesc("Customize the system prompt used to rank tasks. Clear to reset.")
+      .setDesc("Customize the system prompt that guides how the AI ranks your tasks. The prompt receives your priorities text and task list, then returns ranked task IDs. Clear this field to reset to the default prompt. Advanced users can modify the ranking logic here.")
       .addTextArea((ta) => {
         ta.setValue(this.plugin.settings.rankingPrompt)
           .onChange(async (v) => {
