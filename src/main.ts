@@ -7,11 +7,11 @@ import {
 } from "./settings";
 import { TaskItem } from "./types";
 import { normalizeBlockId, ensureMd } from "./utils";
-import { warn, error } from "./logger";
+import { error } from "./logger";
 import { insertTextAtCursor } from "./editor";
 import { promptForCount } from "./modal";
 import { extractPrioritiesFromFile } from "./priorities";
-import { collectOpenTasksViaTasksPlugin } from "./taskCollection";
+import { collectAllOpenTasksDirect } from "./directTaskCollection";
 import { callOpenAIRank } from "./openai";
 
 export default class AiTaskPickerPlugin extends Plugin {
@@ -40,17 +40,16 @@ export default class AiTaskPickerPlugin extends Plugin {
           if (taskCount == null) return;
 
           new Notice("Collecting open tasks…");
-          const tasks = await collectOpenTasksViaTasksPlugin(this.app, this.settings, targetFile);
-          
-          // Restore content if unexpectedly modified during task collection
-          if (editor.getValue() !== initialContent) {
-            warn("Active file was modified during task collection! Restoring original content.");
-            editor.setValue(initialContent);
-          }
+          const tasks = await collectAllOpenTasksDirect(this.app, this.settings, targetFile);
           
           if (!tasks.length) {
             new Notice("No open tasks found.");
             return;
+          }
+          
+          // Restore content if unexpectedly modified
+          if (editor.getValue() !== initialContent) {
+            editor.setValue(initialContent);
           }
 
           new Notice("Reading priorities…");
@@ -73,22 +72,11 @@ export default class AiTaskPickerPlugin extends Plugin {
             const task = tasksById.get(blockId);
             if (!task) continue;
 
-            // Confirm the block is indexed in its background file
-            const targetFile = this.app.vault.getAbstractFileByPath(task.note);
-            if (targetFile instanceof TFile) {
-              const fileCache = this.app.metadataCache.getFileCache(targetFile);
-              const isBlockIndexed = !!fileCache?.blocks && Object.prototype.hasOwnProperty.call(fileCache.blocks, blockId);
-              if (!isBlockIndexed) {
-                warn("Skipping embed; block id not yet indexed", { path: task.note, id: blockId });
-                continue;
-              }
-            }
-
             taskEmbeds.push(`![[${ensureMd(task.note)}#^${blockId}]]`);
           }
 
           if (taskEmbeds.length === 0) {
-            new Notice("No tasks returned (or not yet indexed). Try again shortly.");
+            new Notice("No tasks could be embedded. Try again.");
             return;
           }
 
